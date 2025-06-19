@@ -233,3 +233,13 @@ libs/redis/docs/.Trash*
 *.pyc
 ai
 .claude
+agent-memory-server.code-workspace
+create-autostart-task-simple.ps1
+create-autostart-task.ps1
+docker-compose.autostart.yml
+docker-compose.override.yml
+docker-compose.override.yml.backup
+docker-compose.yml.backup
+start-agent-memory-server-improved.bat
+start-agent-memory-server.bat
+start-agent-memory-server.ps1
