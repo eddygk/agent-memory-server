@@ -17,6 +17,7 @@ ENV UV_LINK_MODE=copy
 # Install system dependencies including build tools
 RUN apt-get update && apt-get install -y \
     curl \
+    procps \
     build-essential \
     gcc \
     g++ \

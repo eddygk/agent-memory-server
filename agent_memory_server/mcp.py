@@ -5,16 +5,10 @@ from typing import Any
 import ulid
 from mcp.server.fastmcp import FastMCP as _FastMCPBase
 
-from agent_memory_server.api import (
-    create_long_term_memory as core_create_long_term_memory,
-    delete_long_term_memory as core_delete_long_term_memory,
-    get_long_term_memory as core_get_long_term_memory,
-    get_working_memory as core_get_working_memory,
-    memory_prompt as core_memory_prompt,
-    put_working_memory as core_put_working_memory,
-    search_long_term_memory as core_search_long_term_memory,
-    update_long_term_memory as core_update_long_term_memory,
-)
+# Import core modules directly to bypass FastAPI dependency injection
+# (don't import from api.py - those functions have Depends() decorators that break in MCP)
+from agent_memory_server import long_term_memory as ltm_module
+from agent_memory_server import working_memory as wm_module
 from agent_memory_server.config import settings
 from agent_memory_server.dependencies import get_background_tasks
 from agent_memory_server.filters import (
@@ -373,17 +367,26 @@ async def create_long_term_memories(
     Returns:
         An acknowledgement response indicating success
     """
+    if not settings.long_term_memory:
+        raise ValueError("Long-term memory is disabled")
+
     # Apply default namespace for STDIO if not provided in memory entries
     for mem in memories:
         if mem.namespace is None and settings.default_mcp_namespace:
             mem.namespace = settings.default_mcp_namespace
         if mem.user_id is None and settings.default_mcp_user_id:
             mem.user_id = settings.default_mcp_user_id
+        # Ensure persisted_at is cleared (server-assigned)
+        mem.persisted_at = None
 
-    payload = CreateMemoryRecordRequest(memories=memories)
-    return await core_create_long_term_memory(
-        payload, background_tasks=get_background_tasks()
+    # Call core function directly (bypasses FastAPI Depends() issues)
+    background_tasks = get_background_tasks()
+    background_tasks.add_task(
+        ltm_module.index_long_term_memories,
+        memories=memories,
+        deduplicate=True,
     )
+    return AckResponse(status="ok")
 
 
 @mcp_app.tool()
@@ -507,6 +510,7 @@ async def search_long_term_memory(
         namespace = Namespace(eq=settings.default_mcp_namespace)
 
     try:
+        # Create SearchRequest to get filters
         payload = SearchRequest(
             text=text,
             session_id=session_id,
@@ -521,9 +525,19 @@ async def search_long_term_memory(
             limit=limit,
             offset=offset,
         )
-        results = await core_search_long_term_memory(
-            payload, optimize_query=optimize_query
-        )
+
+        # Call core function directly (bypasses FastAPI Depends() issues)
+        filters = payload.get_filters()
+        kwargs = {
+            "distance_threshold": payload.distance_threshold,
+            "limit": payload.limit,
+            "offset": payload.offset,
+            "optimize_query": optimize_query,
+            **filters,
+            "text": payload.text or "",
+        }
+        results = await ltm_module.search_long_term_memories(**kwargs)
+
         return MemoryRecordResults(
             total=results.total,
             memories=results.memories,
@@ -647,51 +661,120 @@ async def memory_prompt(
     Returns:
         A list of messages, including memory context and the user's query
     """
-    _session_id = session_id.eq if session_id and session_id.eq else None
-    session = None
+    # Simplified MCP implementation - clients handle token management
+    # (bypasses FastAPI Depends() issues)
+    from mcp.server.fastmcp.prompts import base
+    from mcp.types import TextContent
+    from agent_memory_server.models import SystemMessage, UserMessage
+    from agent_memory_server.utils.redis import get_redis_conn
 
     if user_id is None and settings.default_mcp_user_id:
         user_id = UserId(eq=settings.default_mcp_user_id)
+    if namespace is None and settings.default_mcp_namespace:
+        namespace = Namespace(eq=settings.default_mcp_namespace)
 
-    if _session_id is not None:
-        session = WorkingMemoryRequest(
-            session_id=_session_id,
-            namespace=namespace.eq if namespace and namespace.eq else None,
-            user_id=user_id.eq if user_id and user_id.eq else None,
-            model_name=model_name,
-            context_window_max=context_window_max,
+    redis = await get_redis_conn()
+    _messages = []
+
+    # 1. Get working memory if session provided (no token truncation)
+    if session_id and session_id.eq:
+        working_mem = await wm_module.get_working_memory(
+            session_id=session_id.eq,
+            namespace=namespace.eq if namespace else None,
+            user_id=user_id.eq if user_id else None,
+            redis_client=redis,
         )
 
-    search_payload = SearchRequest(
-        text=query,
-        session_id=session_id,
-        namespace=namespace,
-        topics=topics,
-        entities=entities,
-        created_at=created_at,
-        last_accessed=last_accessed,
-        user_id=user_id,
-        distance_threshold=distance_threshold,
-        memory_type=memory_type,
-        limit=limit,
-        offset=offset,
+        if working_mem:
+            # Add summary as system message if present
+            if working_mem.context:
+                _messages.append(
+                    SystemMessage(
+                        content=TextContent(
+                            type="text",
+                            text=f"## A summary of the conversation so far:\n{working_mem.context}",
+                        ),
+                    )
+                )
+
+            # Convert all messages (no truncation - clients handle this)
+            if working_mem.messages:
+                for msg in working_mem.messages:
+                    if msg.role == "user":
+                        _messages.append(
+                            base.UserMessage(content=TextContent(type="text", text=msg.content))
+                        )
+                    elif msg.role == "assistant":
+                        _messages.append(
+                            base.AssistantMessage(content=TextContent(type="text", text=msg.content))
+                        )
+                    else:
+                        # For system or other roles, use SystemMessage
+                        _messages.append(
+                            SystemMessage(content=TextContent(type="text", text=msg.content))
+                        )
+
+    # 2. Get long-term memories if search criteria provided
+    search_needed = any([
+        topics, entities, created_at, last_accessed, user_id, memory_type
+    ]) or query
+
+    if search_needed:
+        # Build filters dict
+        filters = {}
+        if session_id:
+            filters["session_id"] = session_id
+        if namespace:
+            filters["namespace"] = namespace
+        if topics:
+            filters["topics"] = topics
+        if entities:
+            filters["entities"] = entities
+        if created_at:
+            filters["created_at"] = created_at
+        if last_accessed:
+            filters["last_accessed"] = last_accessed
+        if user_id:
+            filters["user_id"] = user_id
+        if memory_type:
+            filters["memory_type"] = memory_type
+
+        # Perform semantic search using core function
+        search_results = await ltm_module.search_long_term_memories(
+            text=query or "",
+            distance_threshold=distance_threshold,
+            limit=limit,
+            offset=offset,
+            optimize_query=optimize_query,
+            **filters,
+        )
+
+        if search_results.total > 0:
+            # Format long-term memories as system message
+            memory_context = "## Relevant memories from long-term storage:\n\n"
+            for memory in search_results.memories:
+                memory_context += f"- {memory.text}\n"
+
+            _messages.insert(
+                0,
+                SystemMessage(
+                    content=TextContent(type="text", text=memory_context),
+                ),
+            )
+
+            # Update last_accessed for retrieved memories (background task)
+            background_tasks = get_background_tasks()
+            background_tasks.add_task(
+                ltm_module.update_last_accessed,
+                memory_ids=[m.id for m in search_results.memories],
+            )
+
+    # 3. Add the user's query as final message
+    _messages.append(
+        base.UserMessage(content=TextContent(type="text", text=query))
     )
-    _params = {}
-    if session is not None:
-        _params["session"] = session
-    if search_payload is not None:
-        _params["long_term_search"] = search_payload
 
-    # Create a background tasks instance for the MCP call
-    from agent_memory_server.dependencies import HybridBackgroundTasks
-
-    background_tasks = HybridBackgroundTasks()
-
-    return await core_memory_prompt(
-        params=MemoryPromptRequest(query=query, **_params),
-        background_tasks=background_tasks,
-        optimize_query=optimize_query,
-    )
+    return MemoryPromptResponse(messages=_messages)
 
 
 @mcp_app.tool()
@@ -869,15 +952,42 @@ async def set_working_memory(
         long_term_memory_strategy=long_term_memory_strategy or MemoryStrategyConfig(),
     )
 
-    # Update working memory via the API - this handles summarization and background promotion
-    result = await core_put_working_memory(
-        session_id=session_id,
-        memory=update_memory_obj,
-        background_tasks=get_background_tasks(),
+    # Convert UpdateWorkingMemory to WorkingMemory (bypasses FastAPI Depends() issues)
+    from agent_memory_server.utils.redis import get_redis_conn
+    redis = await get_redis_conn()
+
+    working_memory_obj = update_memory_obj.to_working_memory(session_id)
+
+    # Validate that all memories have IDs
+    for mem in working_memory_obj.memories:
+        if not mem.id:
+            raise ValueError("All memory records in working memory must have an ID")
+
+    # Validate that all messages have content
+    for msg in working_memory_obj.messages:
+        if not msg.content or not msg.content.strip():
+            raise ValueError(f"Message content cannot be empty (message ID: {msg.id})")
+
+    # Store in working memory (no summarization for MCP - clients handle that)
+    await wm_module.set_working_memory(
+        working_memory=working_memory_obj,
+        redis_client=redis,
     )
 
-    # Convert to WorkingMemoryResponse to satisfy return type
-    return WorkingMemoryResponse(**result.model_dump())
+    # Background tasks for long-term memory promotion
+    if settings.long_term_memory and (
+        working_memory_obj.memories or working_memory_obj.messages
+    ):
+        background_tasks = get_background_tasks()
+        background_tasks.add_task(
+            ltm_module.promote_working_memory_to_long_term,
+            session_id=session_id,
+            user_id=working_memory_obj.user_id,
+            namespace=working_memory_obj.namespace,
+        )
+
+    # Return WorkingMemoryResponse
+    return WorkingMemoryResponse(**working_memory_obj.model_dump())
 
 
 @mcp_app.tool()
@@ -895,9 +1005,24 @@ async def get_working_memory(
     Returns:
         Working memory containing messages, context, and structured memory records
     """
-    return await core_get_working_memory(
-        session_id=session_id, recent_messages_limit=recent_messages_limit
+    # Call core function directly (bypasses FastAPI Depends() issues)
+    from agent_memory_server.utils.redis import get_redis_conn
+    redis = await get_redis_conn()
+
+    memory = await wm_module.get_working_memory(
+        session_id=session_id,
+        redis_client=redis,
+        recent_messages_limit=recent_messages_limit
     )
+    if not memory:
+        # Return empty working memory if not found
+        from agent_memory_server.models import WorkingMemory
+        return WorkingMemory(
+            session_id=session_id,
+            messages=[],
+            memories=[],
+        )
+    return memory
 
 
 @mcp_app.tool()
@@ -923,7 +1048,14 @@ async def get_long_term_memory(
     get_long_term_memory(memory_id="01HXE2B1234567890ABCDEF")
     ```
     """
-    return await core_get_long_term_memory(memory_id=memory_id)
+    if not settings.long_term_memory:
+        raise ValueError("Long-term memory is disabled")
+
+    # Call core function directly (bypasses FastAPI Depends() issues)
+    memory = await ltm_module.get_long_term_memory_by_id(memory_id)
+    if not memory:
+        raise ValueError(f"Memory with ID {memory_id} not found")
+    return memory
 
 
 @mcp_app.tool()
@@ -1048,9 +1180,18 @@ async def edit_long_term_memory(
 
     # Filter out None values to only include fields that should be updated
     update_dict = {k: v for k, v in update_dict.items() if v is not None}
-    updates = EditMemoryRecordRequest(**update_dict)
 
-    return await core_update_long_term_memory(memory_id=memory_id, updates=updates)
+    if not settings.long_term_memory:
+        raise ValueError("Long-term memory is disabled")
+
+    # Call core function directly (bypasses FastAPI Depends() issues)
+    updated_memory = await ltm_module.update_long_term_memory(
+        memory_id=memory_id,
+        updates=update_dict
+    )
+    if not updated_memory:
+        raise ValueError(f"Memory with ID {memory_id} not found")
+    return updated_memory
 
 
 @mcp_app.tool()
@@ -1082,4 +1223,6 @@ async def delete_long_term_memories(
     if not settings.long_term_memory:
         raise ValueError("Long-term memory is disabled")
 
-    return await core_delete_long_term_memory(memory_ids=memory_ids)
+    # Call core function directly (bypasses FastAPI Depends() issues)
+    await ltm_module.delete_long_term_memories(memory_ids)
+    return AckResponse(status="ok", detail=f"Deleted {len(memory_ids)} memories")
